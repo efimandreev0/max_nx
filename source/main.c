@@ -21,7 +21,7 @@
 
 static void *heap_so_base = NULL;
 static size_t heap_so_limit = 0;
-
+so_module max_mod;
 // provide replacement heap init function to separate newlib heap from the .so
 void __libnx_initheap(void) {
   void *addr;
@@ -127,16 +127,16 @@ int main(void) {
   debugPrintf(" lib base = %p\n", heap_so_base);
   debugPrintf("  lib max = %u KB\n", heap_so_limit / 1024);
 
-  if (so_load(SO_NAME, heap_so_base, heap_so_limit) < 0)
-    fatal_error("Could not load\n%s.", SO_NAME);
+  if (so_load(&max_mod, SO_NAME) < 0)
+    fatal_error("Open app in the applet-mode.\n");
 
   // won't save without it
   mkdir("savegames", 0777);
 
   update_imports();
 
-  so_relocate();
-  so_resolve(dynlib_functions, dynlib_numfunctions, 1);
+  so_relocate(&max_mod);
+  so_resolve(&max_mod, dynlib_functions, sizeof(dynlib_numfunctions), 0);
 
   patch_openal();
   patch_opengl();
@@ -153,12 +153,10 @@ int main(void) {
   uint32_t (* ShowJoystick)(int show) = (void *)so_find_addr_rx("_Z12ShowJoystickb");
   int (* NVEventAppMain)(int argc, char *argv[]) = (void *)so_find_addr_rx("_Z14NVEventAppMainiPPc");
 
-  so_finalize();
-  so_flush_caches();
+  so_flush_caches(&max_mod);
 
-  so_execute_init_array();
+  so_initialize(&max_mod);
 
-  so_free_temp();
 
   initGraphics();
   ShowJoystick(0);
