@@ -13,14 +13,27 @@
 #include "elf.h"
 
 #define ALIGN_MEM(x, align) (((x) + ((align) - 1)) & ~((align) - 1))
-
+#define MAX_DATA_SEG 4
+typedef struct {
+  int size;
+  uint32_t field_4;
+  uint32_t attr;
+  uint32_t field_C;
+  uint32_t paddr;
+  int alignment;
+  uint32_t extraLow;
+  uint32_t extraHigh;
+  uint32_t mirror_blockid;
+  int pid;
+}SceKernelAllocMemBlockKernelOpt;
 //64-bit so_module
-typedef struct so_module {
+typedef struct {
   struct so_module *next;
-  
-  int text_blockid, data_blockid;
-  uintptr_t text_base, data_base;
-  size_t text_size, data_size;
+
+  SharedMemory patch_blockid, text_blockid, data_blockid[MAX_DATA_SEG];
+  uintptr_t patch_base, patch_head, cave_base, cave_head, text_base, data_base[MAX_DATA_SEG];
+  size_t patch_size, cave_size, text_size, data_size[MAX_DATA_SEG];
+  int n_data;
 
   Elf64_Ehdr *ehdr;
   Elf64_Phdr *phdr;
@@ -31,14 +44,14 @@ typedef struct so_module {
   Elf64_Rel *reldyn;
   Elf64_Rel *relplt;
 
-  int (**init_array)(void);
-  uint64_t *hash;
+  int (** init_array)(void);
+  uint32_t *hash;
 
-  uint64_t num_dynamic;
-  uint64_t num_dynsym;
-  uint64_t num_reldyn;
-  uint64_t num_relplt;
-  uint64_t num_init_array;
+  int num_dynamic;
+  int num_dynsym;
+  int num_reldyn;
+  int num_relplt;
+  int num_init_array;
 
   char *soname;
   char *shstr;

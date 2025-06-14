@@ -14,33 +14,46 @@
 #include <malloc.h>
 #include <elf.h>
 
-#include "config.h"
+#include "main.h"
+#include "dialog.h"
 #include "so_util.h"
-#include "util.h"
-#include "error.h"
-#include "elf.h"
 
-void *text_base, *text_virtbase;
-size_t text_size;
+typedef struct b_enc {
+  union {
+    struct __attribute__((__packed__)) {
+      int imm24: 24;
+      unsigned int l: 1; // Branch with Link flag
+      unsigned int enc: 3; // 0b101
+      unsigned int cond: 4; // 0b1110
+    } bits;
+    uint32_t raw;
+  };
+} b_enc;
 
-void *data_base, *data_virtbase;
-size_t data_size;
+typedef struct ldst_enc {
+  union {
+    struct __attribute__((__packed__)) {
+      int imm12: 12;
+      unsigned int rt: 4; // Source/Destination register
+      unsigned int rn: 4; // Base register
+      unsigned int bit20_1: 1; // 0: store to memory, 1: load from memory
+      unsigned int w: 1; // 0: no write-back, 1: write address into base
+      unsigned int b: 1; // 0: word, 1: byte
+      unsigned int u: 1; // 0: subtract offset from base, 1: add to base
+      unsigned int p: 1; // 0: post indexing, 1: pre indexing
+      unsigned int enc: 3;
+      unsigned int cond: 4;
+    } bits;
+    uint32_t raw;
+  };
+} ldst_enc;
 
-static void *load_base, *load_virtbase;
-static size_t load_size;
-static VirtmemReservation *load_memrv;
+#define B_RANGE ((1 << 24) - 1)
+#define B_OFFSET(x) (x + 8) // branch jumps into addr - 8, so range is biased forward
+#define B(PC, DEST) ((b_enc){.bits = {.cond = 0b1110, .enc = 0b101, .l = 0, .imm24 = (((intptr_t)DEST-(intptr_t)PC) / 4) - 2}})
+#define LDR_OFFS(RT, RN, IMM) ((ldst_enc){.bits = {.cond = 0b1110, .enc = 0b010, .p = 1, .u = (IMM >= 0), .b = 0, .w = 0, .bit20_1 = 1, .rn = RN, .rt = RT, .imm12 = (IMM >= 0) ? IMM : -IMM}})
 
-static void *so_base;
-
-static Elf64_Ehdr *elf_hdr;
-static Elf64_Phdr *prog_hdr;
-static Elf64_Shdr *sec_hdr;
-static Elf64_Sym *syms;
-static int num_syms;
-
-static char *shstrtab;
-static char *dynstrtab;
-
+#define PATCH_SZ 0x10000 //64 KB-ish arenas
 static so_module *head = NULL, *tail = NULL;
 
 void hook_thumb(uintptr_t addr, uintptr_t dst) {
@@ -105,127 +118,211 @@ void so_finalize(void) {
   if (R_FAILED(rc)) fatal_error("Error: could not map %u bytes of RW memory at %p (%p) (2):\n%08x", rest_asize, data_virtbase, rest_virtbase, rc);
 }
 
-int so_load(so_module *mod, const char *filename) {
-  int res = 0;
-  uintptr_t data_addr = 0;
-  size_t so_blockid;
-  void *so_data;
-  size_t so_size = 0;
-  
-  memset(mod, 0, sizeof(so_module));
-  
-  FILE *fd = fopen(filename, "rb");
-  if (fd == NULL)
-    return -1;
+int _so_load(so_module *mod, int so_blockid, void *so_data, uintptr_t load_addr) {
+	int res = 0;
+	uintptr_t data_addr = 0;
+	
+	if (memcmp(so_data, ELFMAG, SELFMAG) != 0) {
+		res = -1;
+		goto err_free_so;
+	}
 
-  fseek(fd, 0, SEEK_END);
-  so_size = ftell(fd);
-  fseek(fd, 0, SEEK_SET);
-  
-  so_data = malloc(so_size);
-  if (!so_base) {
-    fclose(fd);
-    return -2;
-  }
+	mod->ehdr = (Elf64_Ehdr *)so_data;
+	mod->phdr = (Elf64_Phdr *)((uintptr_t)so_data + mod->ehdr->e_phoff);
+	mod->shdr = (Elf64_Shdr *)((uintptr_t)so_data + mod->ehdr->e_shoff);
 
-  fread(so_data, so_size, 1, fd);
-  fclose(fd);
+	mod->shstr = (char *)((uintptr_t)so_data + mod->shdr[mod->ehdr->e_shstrndx].sh_offset);
 
-  if (memcmp(so_base, ELFMAG, SELFMAG) != 0) {
-    res = -1;
-    goto err_free_so;
-  }
+	for (int i = 0; i < mod->ehdr->e_phnum; i++) {
+		if (mod->phdr[i].p_type == PT_LOAD) {
+			void *prog_data;
+			size_t prog_size;
 
-  mod->ehdr = (Elf64_Ehdr *)so_data;
-  mod->phdr = (Elf64_Phdr *)((uintptr_t)so_data + mod->ehdr->e_shoff);
-  mod->shdr = (Elf64_Shdr *)((uintptr_t)so_data + mod->ehdr->e_shoff);
-  
-  mod->shstr = (char *)((uintptr_t)so_data + mod->shdr[mod->ehdr->e_shstrndx].sh_offset);
+			if ((mod->phdr[i].p_flags & PF_X) == PF_X) {
+				// Allocate arena for code patches, trampolines, etc
+				// Sits exactly under the desired allocation space
+				mod->patch_size = ALIGN_MEM(PATCH_SZ, mod->phdr[i].p_align);
+				SceKernelAllocMemBlockKernelOpt opt;
+				memset(&opt, 0, sizeof(SceKernelAllocMemBlockKernelOpt));
+				opt.size = sizeof(SceKernelAllocMemBlockKernelOpt);
+				opt.attr = 0x1;
+				opt.field_C = (uint32_t)load_addr - mod->patch_size;
+				res = mod->patch_blockid = kuKernelAllocMemBlock("rx_block", SCE_KERNEL_MEMBLOCK_TYPE_USER_RX, mod->patch_size, &opt);
+				if (res < 0)
+					goto err_free_so;
 
-  // calculate total size of the LOAD segments
-  for (int i = 0; i < mod->ehdr->e_phnum; i++) {
-    if (mod->phdr[i].p_type == PT_LOAD) {
-	  void *prog_data;
-      size_t prog_size;
-      
-      if ((mod->phdr[i].p_flags & PF_X) == PF_X) {
-		prog_size = ALIGN_MEM(mod->phdr[i].p_memsz, mod->phdr[i].p_align);
-		
-		prog_data = (void*)mod->text_blockid;
-		
-		mod->text_blockid
-		mod->phdr[i].p_vaddr += (Elf64_Addr)prog_data;
-		
-		mod->text_base = mod->phdr[i].p_vaddr;
-        mod->text_size = mod->phdr[i].p_memsz;
-		
-		data_addr = (uintptr_t)prog_data + prog_size;
-      } else {
-        if (data_addr == 0)
-          goto err_free_so;
-	  
-	    prog_size = ALIGN_MEM(mod->phdr[i].p_memsz + mod->phdr[i].p_vaddr - (data_addr - mod->text_base), mod->phdr[i].p_align);
-        
-		prog_data = (void*)mod->text_blockid;
-		mod->phdr[i].p_vaddr += (Elf64_Addr)prog_data;
-		
-		mod->text_base = mod->phdr[i].p_vaddr;
-        mod->text_size = mod->phdr[i].p_memsz;
-      }
-    }
-  }
+				sceKernelGetMemBlockBase(mod->patch_blockid, &mod->patch_base);
+				mod->patch_head = mod->patch_base;
 
-  for (int i = 0; i < mod->ehdr->e_shnum; i++) {
-    char *sh_name = mod->shstr + mod->shdr[i].sh_name;
-    uintptr_t sh_addr = mod->text_base + mod->shdr[i].sh_addr;
-    size_t sh_size = mod->shdr[i].sh_size;
-    if (strcmp(sh_name, ".dynamic") == 0) {
-      mod->dynamic = (Elf64_Dyn *)sh_addr;
-      mod->num_dynamic = sh_size / sizeof(Elf64_Dyn);
-    } else if (strcmp(sh_name, ".dynstr") == 0) {
-      mod->dynstr = (char *)sh_addr;
-    } else if (strcmp(sh_name, ".dynsym") == 0) {
-      mod->dynsym = (Elf64_Sym *)sh_addr;
-      mod->num_dynsym = sh_size / sizeof(Elf64_Sym);
-    } else if (strcmp(sh_name, ".rel.dyn") == 0) {
-      mod->reldyn = (Elf64_Rel *)sh_addr;
-      mod->num_reldyn = sh_size / sizeof(Elf64_Rel);
-    } else if (strcmp(sh_name, ".rel.plt") == 0) {
-      mod->relplt = (Elf64_Rel *)sh_addr;
-      mod->num_relplt = sh_size / sizeof(Elf64_Rel);
-    } else if (strcmp(sh_name, ".init_array") == 0) {
-      mod->init_array = (void *)sh_addr;
-      mod->num_init_array = sh_size / sizeof(void *);
-    } else if (strcmp(sh_name, ".hash") == 0) {
-      mod->hash = (void *)sh_addr;
-    }
-  }
+				prog_size = ALIGN_MEM(mod->phdr[i].p_memsz, mod->phdr[i].p_align);
+				memset(&opt, 0, sizeof(SceKernelAllocMemBlockKernelOpt));
+				opt.size = sizeof(SceKernelAllocMemBlockKernelOpt);
+				opt.attr = 0x1;
+				opt.field_C = (SceUInt32)load_addr;
+				res = mod->text_blockid = kuKernelAllocMemBlock("rx_block", SCE_KERNEL_MEMBLOCK_TYPE_USER_RX, prog_size, &opt);
+				if (res < 0)
+					goto err_free_so;
 
-  if (mod->dynamic == NULL ||
-      mod->dynstr == NULL ||
-      mod->dynsym == NULL ||
-      mod->reldyn == NULL ||
-      mod->relplt == NULL) {
-    res = -2;
-    goto err_free_data;
-  }
+				sceKernelGetMemBlockBase(mod->text_blockid, &prog_data);
 
-  return 0;
+				mod->phdr[i].p_vaddr += (Elf64_Addr)prog_data;
 
-err_free_text:
-  virtmemLock();
-  virtmemRemoveReservation(load_memrv);
-  virtmemUnlock();
-  free(mod->data_blockid);
+				mod->text_base = mod->phdr[i].p_vaddr;
+				mod->text_size = mod->phdr[i].p_memsz;
+
+				// Use the .text segment padding as a code cave
+				// Word-align it to make it simpler for instruction arena allocation
+				mod->cave_size = ALIGN_MEM(prog_size - mod->phdr[i].p_memsz, 0x4);
+				mod->cave_base = mod->cave_head = prog_data + mod->phdr[i].p_memsz;
+				mod->cave_base = ALIGN_MEM(mod->cave_base, 0x4);
+				mod->cave_head = mod->cave_base;
+				debugPrintf("code cave: %d bytes (@0x%08X).\n", mod->cave_size, mod->cave_base);
+
+				data_addr = (uintptr_t)prog_data + prog_size;
+			} else {
+				if (data_addr == 0)
+					goto err_free_so;
+
+				if (mod->n_data >= MAX_DATA_SEG)
+					goto err_free_data;
+
+				prog_size = ALIGN_MEM(mod->phdr[i].p_memsz + mod->phdr[i].p_vaddr - (data_addr - mod->text_base), mod->phdr[i].p_align);
+
+				SceKernelAllocMemBlockKernelOpt opt;
+				memset(&opt, 0, sizeof(SceKernelAllocMemBlockKernelOpt));
+				opt.size = sizeof(SceKernelAllocMemBlockKernelOpt);
+				opt.attr = 0x1;
+				opt.field_C = (SceUInt32)data_addr;
+				res = mod->data_blockid[mod->n_data] = kuKernelAllocMemBlock("rw_block", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, prog_size, &opt);
+				if (res < 0)
+					goto err_free_text;
+
+				sceKernelGetMemBlockBase(mod->data_blockid[mod->n_data], &prog_data);
+				data_addr = (uintptr_t)prog_data + prog_size;
+
+				mod->phdr[i].p_vaddr += (Elf64_Addr)mod->text_base;
+
+				mod->data_base[mod->n_data] = mod->phdr[i].p_vaddr;
+				mod->data_size[mod->n_data] = mod->phdr[i].p_memsz;
+				mod->n_data++;
+			}
+
+			char *zero = malloc(prog_size - mod->phdr[i].p_filesz);
+			memset(zero, 0, prog_size - mod->phdr[i].p_filesz);
+			kuKernelCpuUnrestrictedMemcpy(prog_data + mod->phdr[i].p_filesz, zero, prog_size - mod->phdr[i].p_filesz);
+			free(zero);
+
+			kuKernelCpuUnrestrictedMemcpy((void *)mod->phdr[i].p_vaddr, (void *)((uintptr_t)so_data + mod->phdr[i].p_offset), mod->phdr[i].p_filesz);
+		}
+	}
+
+	for (int i = 0; i < mod->ehdr->e_shnum; i++) {
+		char *sh_name = mod->shstr + mod->shdr[i].sh_name;
+		uintptr_t sh_addr = mod->text_base + mod->shdr[i].sh_addr;
+		size_t sh_size = mod->shdr[i].sh_size;
+		if (strcmp(sh_name, ".dynamic") == 0) {
+			mod->dynamic = (Elf64_Dyn *)sh_addr;
+			mod->num_dynamic = sh_size / sizeof(Elf64_Dyn);
+		} else if (strcmp(sh_name, ".dynstr") == 0) {
+			mod->dynstr = (char *)sh_addr;
+		} else if (strcmp(sh_name, ".dynsym") == 0) {
+			mod->dynsym = (Elf64_Sym *)sh_addr;
+			mod->num_dynsym = sh_size / sizeof(Elf64_Sym);
+		} else if (strcmp(sh_name, ".rel.dyn") == 0) {
+			mod->reldyn = (Elf64_Rel *)sh_addr;
+			mod->num_reldyn = sh_size / sizeof(Elf64_Rel);
+		} else if (strcmp(sh_name, ".rel.plt") == 0) {
+			mod->relplt = (Elf64_Rel *)sh_addr;
+			mod->num_relplt = sh_size / sizeof(Elf64_Rel);
+		} else if (strcmp(sh_name, ".init_array") == 0) {
+			mod->init_array = (void *)sh_addr;
+			mod->num_init_array = sh_size / sizeof(void *);
+		} else if (strcmp(sh_name, ".hash") == 0) {
+			mod->hash = (void *)sh_addr;
+		}
+	}
+
+	if (mod->dynamic == NULL ||
+		mod->dynstr == NULL ||
+		mod->dynsym == NULL ||
+		mod->reldyn == NULL ||
+		mod->relplt == NULL) {
+		res = -2;
+		goto err_free_data;
+	}
+
+	for (int i = 0; i < mod->num_dynamic; i++) {
+		switch (mod->dynamic[i].d_tag) {
+		case DT_SONAME:
+			mod->soname = mod->dynstr + mod->dynamic[i].d_un.d_ptr;
+			break;
+		default:
+			break;
+		}
+	}
+
+	sceKernelFreeMemBlock(so_blockid);
+
+	if (!head && !tail) {
+		head = mod;
+		tail = mod;
+	} else {
+		tail->next = mod;
+		tail = mod;
+	}
+
+	return 0;
+
 err_free_data:
-  virtmemLock();
-  virtmemRemoveReservation(load_memrv);
-  virtmemUnlock();
-  free(mod->data_blockid);
+	for (int i = 0; i < mod->n_data; i++)
+		sceKernelFreeMemBlock(mod->data_blockid[i]);
+err_free_text:
+	sceKernelFreeMemBlock(mod->text_blockid);
 err_free_so:
-  free(so_blockid);
+	sceKernelFreeMemBlock(so_blockid);
 
-  return res;
+	return res;
+}
+
+int so_mem_load(so_module *mod, void *buffer, size_t so_size, uintptr_t load_addr) {
+	SceUID so_blockid;
+	void *so_data;
+
+	memset(mod, 0, sizeof(so_module));
+
+	so_blockid = sceKernelAllocMemBlock("so block", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, (so_size + 0xfff) & ~0xfff, NULL);
+	if (so_blockid < 0)
+		return so_blockid;
+
+	sceKernelGetMemBlockBase(so_blockid, &so_data);
+	sceClibMemcpy(so_data, buffer, so_size);
+	
+	return _so_load(mod, so_blockid, so_data, load_addr);
+}
+
+int so_file_load(so_module *mod, const char *filename, uintptr_t load_addr) {
+	SceUID so_blockid;
+	void *so_data;
+
+	memset(mod, 0, sizeof(so_module));
+
+	SceUID fd = sceIoOpen(filename, SCE_O_RDONLY, 0);
+	if (fd < 0)
+		return fd;
+
+	size_t so_size = sceIoLseek(fd, 0, SCE_SEEK_END);
+	sceIoLseek(fd, 0, SCE_SEEK_SET);
+
+	so_blockid = sceKernelAllocMemBlock("so block", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, (so_size + 0xfff) & ~0xfff, NULL);
+	if (so_blockid < 0)
+		return so_blockid;
+
+	sceKernelGetMemBlockBase(so_blockid, &so_data);
+
+	sceIoRead(fd, so_data, so_size);
+	sceIoClose(fd);
+
+	return _so_load(mod, so_blockid, so_data, load_addr);
 }
 
 int so_relocate(so_module *mod) {
